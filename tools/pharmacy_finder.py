@@ -1,9 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-商圏内 調剤薬局リストアップ（薬局ファインダー） ― v2.1
+商圏内 調剤薬局リストアップ（薬局ファインダー） ― v2.2
 ============================================================
 住所と商圏半径を入力すると、圏内の調剤薬局を一覧表示する（門前/面・年間処方箋数つき）。
 旧名：pharmacy_area_finder（〜v1.5.1）。
+
+v2.2 変更点 (2026-10-21): ―― 住所から決めた位置の取り違えを防ぐ（薬局出店分析ツール v2.3 と同じ）
+京都の通り名つき住所（例: 京都市上京区丸太町通河原町東入ル駒之町561-1）を国土地理院(GSI)に渡すと、
+町名が合わない別の町（上京区丸屋町、約1.7km西）の座標を黙って返し、周辺施設の距離がすべてずれた。
+1. 住所の町名と、GSIが返した地名を照合し、一致したものだけを採用する。
+2. 京都の通り名（「〜通…上ル／下ル／東入ル／西入ル」）を除いた住所も候補にして先に試す。
+3. 照合できなければ検索を止め、候補の地名・座標を示す。住所欄に「緯度, 経度」
+   （例: 35.0171, 135.7701）を直接入力すると、その座標で検索できる。
+4. 採用した位置（地名・根拠）を画面とログに表示する。
 
 v2.1 変更点 (2026-09-28): ―― 「ナビィが止まっても動く」「目視確認を差分だけにする」
 （薬局出店分析ツール v2.1〜v2.2 と同じ仕組みを取り込んだ）
@@ -27,7 +36,7 @@ v2.1 変更点 (2026-09-28): ―― 「ナビィが止まっても動く」「�
 """
 import streamlit as st
 
-st.set_page_config(page_title="商圏内 調剤薬局リストアップ v2.1", page_icon="💊", layout="wide")
+st.set_page_config(page_title="商圏内 調剤薬局リストアップ v2.2", page_icon="💊", layout="wide")
 
 # ════════════ 共通部品（薬局出店分析ツール v2.2 と同じコード。単独で動くよう取り込み） ════════════
 # ※ 元ファイルのモジュール説明はコメント化（Streamlitのマジック表示で本文に出るのを防ぐため削除）。
@@ -1208,6 +1217,114 @@ class GeocoderService:
                 return result
         return None
 
+    # ── v2.3: 返却地名を入力と照合するジオコーディング（中心座標用） ─────────────────
+    # GSIは完全一致する町が無いと、先頭の文字が近い別の町を黙って返す（例: 京都の通り名つき住所
+    # 「…丸太町通河原町東入ル駒之町」→ 上京区丸屋町）。返却地名の町名が入力と合うかを確かめる。
+    _LATLON_RE = re.compile(r"^\s*(-?\d{1,3}\.\d+)\s*[,，、\s]\s*(-?\d{1,3}\.\d+)\s*$")
+    # 京都の通り名（「丸太町通河原町東入ル」「寺町通御池下ル」）。区・市の直後に付く。
+    _KYOTO_STREET_RE = re.compile(
+        r"(?<=[区市])[^\s\d区市]{1,8}通[^\s\d区市]{0,8}?"
+        r"(?:上ル|下ル|上る|下る|東入ル|西入ル|東入る|西入る|東入|西入)")
+
+    @staticmethod
+    def _town_of(text: str) -> str:
+        """住所・地名から、都道府県・郡・市・区を除いた最初の数字までの町名部分を取り出す（比較用に表記を寄せる）。"""
+        t = re.sub(r"[\s　]", "", text or "")
+        t = t.replace("大字", "").replace("字", "").replace("ヶ", "ケ").replace("ヵ", "ケ")
+        t = t.replace("之", "の").replace("ノ", "の")
+        t = re.sub(r"^(?:北海道|東京都|京都府|大阪府|[^\d]{2,3}?県)", "", t)
+        t2 = re.sub(r"^[^\d市]{1,6}?郡", "", t)
+        if t2 != t:
+            t = t2
+        else:
+            t = re.sub(r"^[^\d]{1,6}?市", "", t)
+            t = re.sub(r"^[^\d]{1,5}?区", "", t)
+        return re.match(r"[^\d０-９]*", t).group().strip("-－ー、,")
+
+    def _title_ok(self, query: str, title: str) -> bool:
+        a, b = self._town_of(query), self._town_of(title)
+        if not a:
+            return True          # 町名が無い住所（市区止まり）は照合できない
+        if not b:
+            return False         # 区止まりの座標＝町まで特定できていない
+        return a in b or b in a
+
+    def _gsi_full(self, q: str) -> Optional[Tuple[float, float, str]]:
+        try:
+            r = requests.get(self.GSI_URL, params={"q": q}, headers=self.HEADERS, timeout=6)
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    coords = data[0].get("geometry", {}).get("coordinates", [])
+                    if len(coords) == 2:
+                        lon, lat = float(coords[0]), float(coords[1])
+                        if self._is_japan(lat, lon):
+                            return lat, lon, str(data[0].get("properties", {}).get("title", ""))
+        except Exception:
+            pass
+        return None
+
+    def _nominatim_full(self, q: str) -> Optional[Tuple[float, float, str]]:
+        try:
+            r = requests.get(
+                self.NOMINATIM_URL,
+                params={"q": q + " 日本", "format": "json", "limit": 1},
+                headers=self.HEADERS, timeout=8,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+                    if self._is_japan(lat, lon):
+                        return lat, lon, str(data[0].get("display_name", ""))
+        except Exception:
+            pass
+        return None
+
+    def geocode_checked(self, address: str) -> dict:
+        """住所→座標。返却地名が入力の町名と合うものだけ採用する。
+
+        戻り値: {"status": "ok"|"mismatch"|"fail", "coords": (lat, lon)|None, "title": 採用した地名,
+                 "source": 根拠, "town": 入力の町名, "candidate": 不一致だった最有力候補 (lat, lon, title)|None}
+        住所欄に「緯度, 経度」を直接入れた場合は、その座標をそのまま採用する（利用者が明示した位置）。
+        """
+        m = self._LATLON_RE.match(address or "")
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if self._is_japan(lat, lon):
+                return {"status": "ok", "coords": (lat, lon), "title": "緯度経度の直接入力",
+                        "source": "直接入力", "town": "", "candidate": None}
+        clean = self._clean(address)
+        no_street = self._KYOTO_STREET_RE.sub("", clean)
+        variants: List[str] = []
+        for base in ([no_street] if no_street != clean else []) + [clean]:
+            for w in (base, self._shorten(base)):
+                if w and w not in variants:
+                    variants.append(w)
+        town = self._town_of(clean)
+        cand = None
+        for w in variants:
+            r = self._gsi_full(w)
+            if not r:
+                continue
+            if self._title_ok(w, r[2]):
+                return {"status": "ok", "coords": (r[0], r[1]), "title": r[2],
+                        "source": "GSI", "town": town, "candidate": None}
+            cand = cand or r
+        for w in variants[:2]:
+            time.sleep(1.0)
+            r = self._nominatim_full(w)
+            if not r:
+                continue
+            tw = self._town_of(w)
+            flat = re.sub(r"[\s　、,]", "", r[2]).replace("之", "の").replace("ノ", "の")
+            if tw and tw in flat:
+                return {"status": "ok", "coords": (r[0], r[1]), "title": r[2],
+                        "source": "Nominatim", "town": town, "candidate": None}
+            cand = cand or r
+        return {"status": "mismatch" if cand else "fail", "coords": None, "title": "",
+                "source": "", "town": town, "candidate": cand}
+
     def geocode_with_verification(
         self, address: str
     ) -> Tuple[Optional[Tuple[float, float]], str]:
@@ -1260,6 +1377,29 @@ class GeocoderService:
         except Exception:
             pass
         return None
+
+
+def _show_geocode_failure(address: str, chk: dict) -> None:
+    """住所から位置を確定できなかったときの案内（分析はその地点では進めない）。"""
+    town = chk.get("town") or "（町名なし）"
+    cand = chk.get("candidate")
+    if cand:
+        st.error(
+            f"住所「{address}」の位置を確定できませんでした。入力の町名「{town}」に対し、"
+            f"地図サービスが返した地名は「{cand[2]}」（lat={cand[0]:.5f}, lon={cand[1]:.5f}）で、"
+            "一致しません。誤った位置で分析すると周辺施設の距離がすべてずれるため、この地点の分析を止めました。\n\n"
+            "対処：①住所を修正する（京都の通り名は外し、町名＋番地にする。例：○○区駒之町561-1）、"
+            "②住所欄に「緯度, 経度」を直接入力する（例：35.0171, 135.7701。地図アプリで店舗位置を右クリックして取得）。"
+            "上の候補で続行したい場合は、その緯度・経度をそのまま住所欄に入力してください。")
+    else:
+        st.error(
+            f"住所「{address}」の位置を特定できませんでした。住所を修正するか、"
+            "住所欄に「緯度, 経度」（例：35.0171, 135.7701）を直接入力してください。")
+
+
+def _geocode_note(chk: dict) -> str:
+    c = chk["coords"]
+    return f"採用した位置：{chk['title']}（{chk['source']}） lat={c[0]:.5f}, lon={c[1]:.5f}"
 
 
 # ─── フィールドパーサ群 ────────────────────────────────────────────────────────
@@ -3519,14 +3659,16 @@ def run_analysis(
     # Step 1: 住所ジオコーディング → 中心座標
     prog.progress(3, text="Step1: 住所をジオコーディング中…")
     t0 = time.time()
-    coords = geocoder.geocode(address)
-    if not coords:
-        st.error(f"住所「{address}」の座標取得に失敗しました。より詳細な住所を入力してください。")
+    chk = geocoder.geocode_checked(address)
+    if chk["status"] != "ok":
+        _show_geocode_failure(address, chk)
+        log.append(f"[Step1] ⚠️ 位置を確定できず分析を中止: {address}")
         st.stop()
-    center_lat, center_lon = coords
+    center_lat, center_lon = chk["coords"]
+    st.session_state.setdefault("geo_notes", {})[address] = _geocode_note(chk)
     log.append(
         f"[Step1] ジオコーディング完了: lat={center_lat:.5f}, lon={center_lon:.5f} "
-        f"({time.time()-t0:.1f}s)"
+        f"{chk['title']}（{chk['source']}） ({time.time()-t0:.1f}s)"
     )
     med_radius = radius_m + gate_m
 
@@ -4185,7 +4327,7 @@ def rx_category(fac):
 # ════════════════════════════════ 薬局ファインダー 本体 ════════════════════════════════
 import traceback
 
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 
 
 def get_scraper() -> MHLWScraper:
